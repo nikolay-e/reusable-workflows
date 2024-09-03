@@ -1,0 +1,275 @@
+name: Docker Build and Deploy to VPS with Nginx Configuration
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Name of the Docker image to build and deploy"
+        required: true
+        type: string
+      container_port:
+        description: "Port the container will listen on locally"
+        required: true
+        type: number
+      domain:
+        description: "Domain or subdomain for the application"
+        required: true
+        type: string
+      docker_context:
+        description: "Docker build context"
+        required: false
+        type: string
+        default: "."
+      docker_file:
+        description: "Path to the Dockerfile"
+        required: false
+        type: string
+        default: "Dockerfile"
+    secrets:
+      DOCKER_REGISTRY_USERNAME:
+        description: "Username for Docker registry"
+        required: true
+      DOCKER_REGISTRY_TOKEN:
+        description: "Token for Docker registry"
+        required: true
+      VPS_SSH_PRIVATE_KEY:
+        description: "SSH private key for VPS access"
+        required: true
+      VPS_HOST:
+        description: "IP address or hostname of the VPS"
+        required: true
+      VPS_USER:
+        description: "Username for SSH access to VPS"
+        required: true
+      SSL_CERT:
+        description: "SSL certificate content"
+        required: true
+      SSL_KEY:
+        description: "SSL private key content"
+        required: true
+
+env:
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+          fetch-depth: 0 
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: ${{ inputs.docker_context }}
+          file: ${{ inputs.docker_file }}
+          push: true
+          tags: ${{ secrets.DOCKER_REGISTRY_USERNAME }}/${{ inputs.image_name }}:latest,${{ secrets.DOCKER_REGISTRY_USERNAME }}/${{ inputs.image_name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  
+  prepare-vps:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    steps:
+      - name: Prepare VPS
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          echo "$SSH_PRIVATE_KEY" > private_key && chmod 600 private_key
+          ssh -o StrictHostKeyChecking=no -i private_key ${VPS_USER}@${VPS_HOST} '
+            # Update package list and upgrade non-interactively
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+            # Install essential packages
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y curl git
+
+            # Install Docker if not already installed
+            if ! command -v docker &> /dev/null; then
+              curl -fsSL https://get.docker.com -o get-docker.sh
+              sudo sh get-docker.sh
+              sudo usermod -aG docker $USER
+            fi
+
+            # Ensure Docker service is running and enabled
+            sudo systemctl start docker
+            sudo systemctl enable docker
+
+            # Install Docker Compose if not already installed
+            if ! command -v docker-compose &> /dev/null; then
+              sudo curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+              sudo chmod +x /usr/local/bin/docker-compose
+            fi
+
+            # Install Nginx if not already installed
+            if ! command -v nginx &> /dev/null; then
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+            fi
+
+            # Ensure Nginx service is running and enabled
+            sudo systemctl start nginx
+            sudo systemctl enable nginx
+
+            # Set up firewall (ufw) if not already configured
+            if ! sudo ufw status | grep -q "Status: active"; then
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+              sudo ufw default deny incoming
+              sudo ufw default allow outgoing
+              sudo ufw allow ssh
+              sudo ufw allow http
+              sudo ufw allow https
+              echo "y" | sudo ufw enable
+            fi
+
+            # Print system info
+            echo "System updated and Docker, Nginx installation checked"
+            uname -a
+            docker --version
+            docker-compose --version
+            nginx -v
+            sudo ufw status
+          '
+
+  deploy-and-configure:
+    runs-on: ubuntu-latest
+    needs: [prepare-vps]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Create Nginx configuration
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          CONTAINER_PORT: ${{ inputs.container_port }}
+        run: |
+          cat << EOF > nginx.conf.template
+          server {
+              listen 80;
+              server_name ${DOMAIN} www.${DOMAIN};
+              return 301 https://\$server_name\$request_uri;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name ${DOMAIN} www.${DOMAIN};
+
+              ssl_certificate /etc/nginx/ssl/${DOMAIN}.crt;
+              ssl_certificate_key /etc/nginx/ssl/${DOMAIN}.key;
+
+              location / {
+                  proxy_pass http://localhost:${CONTAINER_PORT};
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          EOF
+
+          sed -e "s/DOMAIN/${DOMAIN}/g" -e "s/CONTAINER_PORT/${CONTAINER_PORT}/g" nginx.conf.template > nginx.conf
+          
+          echo "Nginx configuration created. Content:"
+          cat nginx.conf
+
+      - name: Deploy to VPS and Configure Nginx
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          CONTAINER_PORT: ${{ inputs.container_port }}
+          DOMAIN: ${{ inputs.domain }}
+          SSL_CERT: ${{ secrets.SSL_CERT }}
+          SSL_KEY: ${{ secrets.SSL_KEY }}
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+          
+          echo "Starting deployment process..."
+          
+          # Set up SSH key
+          echo "$SSH_PRIVATE_KEY" > private_key && chmod 600 private_key
+          
+          # Create temporary files for SSL cert and key
+          echo "$SSL_CERT" > cert.pem
+          echo "$SSL_KEY" > key.pem
+
+          # Transfer SSL certificates and Nginx configuration
+          scp -i private_key -o StrictHostKeyChecking=no cert.pem ${VPS_USER}@${VPS_HOST}:/tmp/cert.pem
+          scp -i private_key -o StrictHostKeyChecking=no key.pem ${VPS_USER}@${VPS_HOST}:/tmp/key.pem
+          scp -i private_key -o StrictHostKeyChecking=no nginx.conf ${VPS_USER}@${VPS_HOST}:/tmp/nginx.conf
+
+          # Remove temporary files
+          rm cert.pem key.pem nginx.conf nginx.conf.template
+
+          # Execute remote commands
+          ssh -i private_key -o StrictHostKeyChecking=no ${VPS_USER}@${VPS_HOST} << EOF
+            set -e  # Exit immediately if a command exits with a non-zero status
+            
+            echo "Setting up environment variables..."
+            DOCKER_USERNAME='${DOCKER_USERNAME}'
+            IMAGE_NAME='${IMAGE_NAME}'
+            CONTAINER_PORT='${CONTAINER_PORT}'
+            DOMAIN='${DOMAIN}'
+
+            # ... [Update system, install dependencies, check Docker installation] ...
+
+            echo "Moving SSL certificates..."
+            sudo mkdir -p /etc/nginx/ssl
+            sudo mv /tmp/cert.pem /etc/nginx/ssl/\${DOMAIN}.crt
+            sudo mv /tmp/key.pem /etc/nginx/ssl/\${DOMAIN}.key
+            sudo chmod 600 /etc/nginx/ssl/\${DOMAIN}.crt /etc/nginx/ssl/\${DOMAIN}.key
+
+            echo "Deploying new container..."
+            IMAGE_HASH=\${DOCKER_USERNAME}/\${IMAGE_NAME}:latest
+            echo "Using image: \${IMAGE_HASH}"
+
+            docker pull \${IMAGE_HASH}
+            docker stop \${IMAGE_NAME}-container || true
+            docker rm \${IMAGE_NAME}-container || true
+            docker run -d --name \${IMAGE_NAME}-container \
+              --restart unless-stopped \
+              -p 127.0.0.1:\${CONTAINER_PORT}:80 \
+              \${IMAGE_HASH}
+
+            echo "Verifying container is running..."
+            docker ps | grep \${IMAGE_NAME}-container
+
+            echo "Printing container logs..."
+            docker logs \${IMAGE_NAME}-container
+
+            echo "Cleaning up old images..."
+            docker image prune -af
+
+            echo "Moving Nginx configuration..."
+            sudo mkdir -p /etc/nginx/sites-available
+            sudo mkdir -p /etc/nginx/sites-enabled
+
+            sudo mv /tmp/nginx.conf /etc/nginx/sites-available/\${DOMAIN}.conf
+            sudo ln -sf /etc/nginx/sites-available/\${DOMAIN}.conf /etc/nginx/sites-enabled/
+
+            echo "Testing Nginx configuration..."
+            sudo nginx -t
+
+            echo "Reloading Nginx..."
+            sudo systemctl reload nginx
+
+            echo "Deployment completed. Application is running on https://\${DOMAIN}"
+          EOF
+
+          echo "Deployment process completed successfully."
