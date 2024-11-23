@@ -1,3 +1,5 @@
 *.secret
 *.crt
 *.key
+.idea
+directory_tree.yaml
