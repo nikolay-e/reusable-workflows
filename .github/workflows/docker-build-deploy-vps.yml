@@ -70,15 +70,33 @@ jobs:
           username: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
+      - name: Set environment variables
+        run: |
+          echo "DEPLOY_ENV=${{ github.ref == 'refs/heads/main' && 'production' || 'test' }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "LATEST_TAG=latest" >> $GITHUB_ENV
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v4
         with:
           context: ${{ inputs.docker_context }}
           file: ${{ inputs.docker_file }}
           push: true
-          tags: ${{ secrets.DOCKER_REGISTRY_USERNAME }}/${{ inputs.image_name }}:latest,${{ secrets.DOCKER_REGISTRY_USERNAME }}/${{ inputs.image_name }}:${{ github.sha }}
+          tags: |
+            ${{ secrets.DOCKER_REGISTRY_USERNAME }}/${{ inputs.image_name }}:${{ env.IMAGE_TAG }}
+            ${{ github.ref == 'refs/heads/main' && format('{0}/{1}:latest', secrets.DOCKER_REGISTRY_USERNAME, inputs.image_name) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Log build details
+        run: |
+          echo "::group::Build Details"
+          echo "Environment: ${{ env.DEPLOY_ENV }}"
+          echo "Image: ${{ secrets.DOCKER_REGISTRY_USERNAME }}/${{ inputs.image_name }}:${{ env.IMAGE_TAG }}"
+          [[ -n "${{ env.LATEST_TAG }}" ]] && echo "Latest Tag: ${{ secrets.DOCKER_REGISTRY_USERNAME }}/${{ inputs.image_name }}:latest"
+          echo "::endgroup::"
   
   prepare-vps:
     runs-on: ubuntu-latest
